@@ -1,0 +1,81 @@
+#!/usr/bin/env ruby
+
+require 'xxhash'
+require 'fileutils'
+require 'parallel'
+
+def open_file(file)
+  case RUBY_PLATFORM
+  when /linux/
+    system("xdg-open", file)
+  when /darwin/
+    system("open", file)
+  when /mswin|mingw/
+    system("start", file)
+  else
+    puts "Sorry, file preview is not supported on this platform."
+  end
+end
+
+# Group files by size
+files_by_size = Dir.glob("**/*")
+                  .select { |file| File.file?(file) }
+                  .group_by { |file| File.size(file) }
+                  .select { |_, files| files.length > 1 }
+
+total_files = files_by_size.values.flatten.count
+processed_files = 0
+
+# Generate hashes for files with the same size
+hash_groups = files_by_size.flat_map do |_, files_with_same_size|
+  Parallel.map(files_with_same_size, in_threads: Parallel.processor_count) do |file|
+    processed_files += 1
+    puts "Processing file #{processed_files}/#{total_files}: #{file}"
+    [XXhash.xxh64_file(file).to_s(16), file]
+  end
+end.group_by(&:first)
+  .transform_values { |group| group.map(&:last) }
+  .select { |_, group| group.length > 1 }
+
+# Deduplicate files by asking the user whether they want to remove the duplicates
+hash_groups.each do |hash, dup_group|
+  puts "Duplicate files with xxHash #{hash} found:"
+  dup_group.each_with_index { |dup_file, index| puts "#{index + 1}. #{dup_file}" }
+
+  loop do
+    print "Enter the number of the file you want to delete, 'a' to delete all except one, 'p' to preview all files in the group, or 's' to skip: "
+    choice = gets.chomp
+
+    if choice =~ /^[0-9]+$/ && choice.to_i.between?(1, dup_group.length)
+      to_delete_index = choice.to_i - 1
+      FileUtils.rm(dup_group[to_delete_index])
+      puts "Removed duplicate file: #{dup_group[to_delete_index]}"
+      break
+    elsif choice == 'a'
+      print "Enter the number of the file you want to keep: "
+      keep_choice = gets.chomp.to_i
+      if keep_choice.between?(1, dup_group.length)
+        dup_group.each_with_index do |dup_file, index|
+          next if index == keep_choice - 1
+          FileUtils.rm(dup_file)
+          puts "Removed duplicate file: #{dup_file}"
+        end
+      else
+        puts "Invalid choice. Please try again."
+      end
+      break
+    elsif choice == 'p'
+      dup_group.each do |dup_file|
+        open_file(dup_file)
+        puts "Previewing file: #{dup_file}"
+        puts "Press Enter to continue with the next file, or type 'stop' to stop previewing files."
+        break if gets.chomp == "stop"
+      end
+    elsif choice == 's'
+      puts "Skipped deleting duplicate files."
+      break
+    else
+      puts "Invalid choice. Please try again."
+    end
+  end
+end
